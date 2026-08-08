@@ -1,0 +1,47 @@
+# bash completion for users-pro
+_users_pro() {
+  local cur prev cmd
+  COMPREPLY=()
+  cur=${COMP_WORDS[COMP_CWORD]}
+  prev=${COMP_WORDS[COMP_CWORD-1]}
+  cmd=${COMP_WORDS[1]:-}
+
+  local globals="--dry-run --yes --quiet --verbose --json --no-color --audit-log --help"
+
+  if (( COMP_CWORD == 1 )); then
+    mapfile -t COMPREPLY < <(compgen -W "tui add delete info list edit disable enable keys audit help" -- "$cur")
+    return
+  fi
+
+  case $prev in
+    -u|--username)
+      mapfile -t COMPREPLY < <(compgen -W "$(getent passwd | awk -F: '$3>=1000 && $3<60000 {print $1}')" -- "$cur")
+      return ;;
+    --shell)
+      mapfile -t COMPREPLY < <(compgen -W "$(grep -v '^#' /etc/shells 2>/dev/null) /usr/sbin/nologin" -- "$cur")
+      return ;;
+    --groups|--add-groups|--remove-groups|--set-groups)
+      mapfile -t COMPREPLY < <(compgen -W "$(getent group | cut -d: -f1)" -- "$cur")
+      return ;;
+    --backup-home|--add-file|--audit-log)
+      mapfile -t COMPREPLY < <(compgen -f -- "$cur")
+      return ;;
+    --ssh-password-auth) mapfile -t COMPREPLY < <(compgen -W "auto yes no" -- "$cur"); return ;;
+    --sudo-nopasswd)     mapfile -t COMPREPLY < <(compgen -W "yes no" -- "$cur"); return ;;
+  esac
+
+  local opts="$globals"
+  case $cmd in
+    add)     opts+=" -u --username --shell --comment --groups --uid --home --expire-date --ssh-password-auth --allow-privileged --sudo-nopasswd --generate-password --password-stdin --no-password" ;;
+    delete)  opts+=" -u --username --force --keep-home --backup-home --purge-temp" ;;
+    info)    opts+=" -u --username" ;;
+    list)    opts+=" --all --locked --privileged --filter" ;;
+    edit)    opts+=" -u --username --password --password-stdin --generate-password --lock --unlock --force-password-change --shell --home --move-home --comment --expire-date --min-days --max-days --warn-days --inactive-days --add-groups --remove-groups --set-groups --ssh-password-auth --sudo-nopasswd --allow-privileged --force" ;;
+    disable|enable) opts+=" -u --username --shell --force" ;;
+    keys)    opts+=" -u --username --list --add --add-file --remove --clear" ;;
+    audit)   opts+=" -l --lines" ;;
+    tui)     opts=" --dry-run --no-color --audit-log --help" ;;
+  esac
+  mapfile -t COMPREPLY < <(compgen -W "$opts" -- "$cur")
+}
+complete -F _users_pro users-pro

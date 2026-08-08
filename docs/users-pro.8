@@ -1,0 +1,143 @@
+.TH USERS-PRO 8 "2026-08-08" "users-pro 2.2.0" "System Administration"
+.SH NAME
+users-pro \- local account lifecycle management with a terminal interface
+.SH SYNOPSIS
+.B users-pro
+.RI [ command ]
+.RI [ options ]
+.br
+.B users-pro tui
+.SH DESCRIPTION
+.B users-pro
+manages local user accounts on Ubuntu 26.04 LTS: creation, deletion, editing,
+password and aging policy, group membership, per-user SSH
+.B PasswordAuthentication
+and
+.BR authorized_keys ,
+and optional managed sudoers drop-ins.
+.PP
+Run without arguments it launches a full-screen interface. Every operation is
+also available as a scriptable subcommand.
+.SH COMMANDS
+.TP
+.B tui
+Launch the interactive interface. Without root it is read-only.
+.TP
+.B add
+Create an account.
+.TP
+.B delete
+Delete an account and its artifacts.
+.TP
+.B info
+Detailed report for one account.
+.TP
+.B list
+List accounts.
+.TP
+.B edit
+Modify an existing account.
+.TP
+.B disable
+Lock, expire and set nologin in one step.
+.TP
+.B enable
+Reverse
+.BR disable .
+.TP
+.B keys
+Manage SSH authorized_keys.
+.TP
+.B audit
+Show recent audit log entries.
+.SH GLOBAL OPTIONS
+.TP
+.BR \-n ", " \-\-dry\-run
+Report intended actions without applying them.
+.TP
+.BR \-y ", " \-\-yes
+Assume yes for all confirmations.
+.TP
+.BR \-q ", " \-\-quiet
+Suppress informational output.
+.TP
+.BR \-v ", " \-\-verbose
+Emit debug output.
+.TP
+.B \-\-json
+Machine-readable output for
+.B info
+and
+.BR list .
+.TP
+.B \-\-no\-color
+Disable ANSI colour.
+.TP
+.BI \-\-audit\-log " PATH"
+Override the audit log path.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 64
+Usage error.
+.TP
+.B 65
+Invalid data.
+.TP
+.B 67
+No such user.
+.TP
+.B 69
+Missing dependency.
+.TP
+.B 70
+Internal failure.
+.TP
+.B 77
+Permission denied.
+.TP
+.B 78
+Configuration error.
+.TP
+.B 79
+Conflict.
+.SH FILES
+.TP
+.I /var/log/users-pro.log
+Audit trail of every mutation, mode 0640.
+.TP
+.I /etc/ssh/sshd_config.d/99-users-pro-USER.conf
+Managed per-user SSH drop-in.
+.TP
+.I /etc/sudoers.d/90-users-pro-USER
+Managed NOPASSWD sudoers entry.
+.TP
+.I /run/lock/users-pro.lock
+Advisory lock against concurrent runs.
+.SH SECURITY
+Passwords are passed to
+.BR chpasswd (8)
+through the shell's
+.B printf
+builtin and never appear in process arguments. Home directory archives are
+created mode 0600. SSH configuration changes are validated with
+.B sshd -t
+and rolled back if rejected.
+.SH EXAMPLES
+.PP
+.nf
+users-pro tui
+users-pro add -u deploy --groups docker --generate-password
+users-pro edit -u deploy --max-days 90 --add-groups www-data
+users-pro list --json | jq '.[] | select(.state=="LOCKED")'
+users-pro --dry-run delete -u olduser --backup-home /var/backups/old.tar.gz
+.fi
+.SH SEE ALSO
+.BR useradd (8),
+.BR usermod (8),
+.BR userdel (8),
+.BR chage (1),
+.BR sshd_config (5),
+.BR sudoers (5)
