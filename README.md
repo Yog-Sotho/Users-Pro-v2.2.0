@@ -1,4 +1,4 @@
-# users-pro 2.2.0
+# users-pro 2.2.0 by YogSotho
 
 Local account lifecycle management for Ubuntu 26.04 LTS — a full-screen
 terminal interface backed by a scriptable CLI.
@@ -212,7 +212,6 @@ tests/tui-tests.sh     pty-driven interface tests
 tests/tui-drive.py     pty driver and terminal emulator
 build.sh               flatten to single-file bundles
 install.sh             install / uninstall
-AUDIT.md               v1.0.0 defect report
 ```
 
 The library knows nothing about `argv` and never prints usage; the entry points
@@ -268,3 +267,9 @@ the known-bad build to confirm they actually go red.
   `ssh-keygen`, `python3` (tests only)
 
 Tuned for Ubuntu 26.04 LTS; runs on any systemd Linux with shadow-utils.
+
+---
+
+## Author
+
+`YogSotho`
