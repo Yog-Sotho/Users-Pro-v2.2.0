@@ -1,4 +1,9 @@
-# users-pro 2.2.0 by YogSotho
+<p align="center">
+  <img src="assets/banner.svg" alt="Users-Pro.v2.2.0 Banner" width="100%">
+</p>
+
+
+# Users-Pro 2.2.0 by YogSotho
 
 Local account lifecycle management for Ubuntu 26.04 LTS — a full-screen
 terminal interface backed by a scriptable CLI.
