@@ -256,11 +256,6 @@ The TUI tests drive the real binary through a pseudoterminal. `tui-tests.sh`
 asserts on the rendered frame; `tui-survival.py` goes further and keeps pressing
 keys *after* each dialog is dismissed, then checks the process is still alive.
 
-That second suite exists because asserting on a frame is not enough. A refusal
-modal can render perfectly and the session can still die the moment you dismiss
-it — which is exactly what shipped in 2.1.0. Both suites are validated against
-the known-bad build to confirm they actually go red.
-
 ---
 
 ## Requirements
