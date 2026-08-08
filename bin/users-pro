@@ -1,0 +1,588 @@
+#!/usr/bin/env bash
+# =============================================================================
+# users-pro — Local account lifecycle management for Ubuntu 26.04 LTS.
+# Usage: users-pro <command> [options]     |     users-pro tui
+# =============================================================================
+
+set -Eeuo pipefail
+
+_self=${BASH_SOURCE[0]}
+while [[ -L $_self ]]; do
+  _target=$(readlink -- "$_self")
+  [[ $_target == /* ]] && _self=$_target || _self=$(dirname -- "$_self")/$_target
+done
+SCRIPT_DIR=$(cd -- "$(dirname -- "$_self")" && pwd -P)
+LIB_DIR=${USERS_PRO_LIB:-$(cd -- "${SCRIPT_DIR}/../lib" && pwd -P)}
+readonly SCRIPT_DIR LIB_DIR
+unset _self _target
+
+SCRIPT_NAME=$(basename -- "${BASH_SOURCE[0]}")
+readonly SCRIPT_NAME
+
+# shellcheck source=../lib/core.sh
+source "${LIB_DIR}/core.sh"
+# shellcheck source=../lib/ssh.sh
+source "${LIB_DIR}/ssh.sh"
+# shellcheck source=../lib/query.sh
+source "${LIB_DIR}/query.sh"
+# shellcheck source=../lib/account.sh
+source "${LIB_DIR}/account.sh"
+
+trap 'core_cleanup' EXIT
+# FIX: the original set -E without ever installing an ERR trap, so the flag was
+# inert and unexpected failures produced a bare exit code with no location.
+# BASH_SOURCE/LINENO inside a trap string report the trap itself, which is
+# useless. BASH_COMMAND names the command that actually failed.
+trap 'trap_rc=$?; trap - ERR; log_error "Unhandled failure: ${BASH_COMMAND} (exit ${trap_rc})"; exit "$trap_rc"' ERR
+
+# =============================================================================
+# Table-driven option parsing
+# =============================================================================
+# Replaces ~450 lines of copy-pasted case arms. Each command declares a spec of
+# "name:kind" where kind is `value` or `flag`; results land in OPT[<name>].
+
+declare -A OPT=()
+declare -a POSITIONAL=()
+
+parse_options() {
+  local spec_name=$1; shift
+  local -n _spec=$spec_name
+  local -A kind=() alias=()
+  local entry key k a
+
+  for entry in "${_spec[@]}"; do
+    key=${entry%%:*}
+    k=${entry#*:}
+    if [[ $k == *:* ]]; then
+      a=${k#*:}; k=${k%%:*}
+      for a in ${a//,/ }; do alias[$a]=$key; done
+    fi
+    kind[$key]=$k
+  done
+
+  OPT=()
+  POSITIONAL=()
+
+  while (( $# > 0 )); do
+    local arg=$1 name="" value="" has_value=no
+    case $arg in
+      --) shift; POSITIONAL+=("$@"); break ;;
+      --*=*) name=${arg%%=*}; name=${name#--}; value=${arg#*=}; has_value=yes ;;
+      --*)   name=${arg#--} ;;
+      -?)    name=${alias[$arg]:-} ; [[ -n $name ]] || die "-$EX_USAGE" "Unknown option: $arg" ;;
+      *)     POSITIONAL+=("$arg"); shift; continue ;;
+    esac
+
+    [[ -n ${kind[$name]:-} ]] || die "-$EX_USAGE" "Unknown option for '${CURRENT_COMMAND}': ${arg}"
+
+    if [[ ${kind[$name]} == value ]]; then
+      if [[ $has_value == no ]]; then
+        (( $# >= 2 )) || die "-$EX_USAGE" "Option '${arg}' requires a value."
+        value=$2
+        shift
+      fi
+      OPT[$name]=$value
+      OPT[__set_${name}]=1
+    else
+      [[ $has_value == yes ]] && die "-$EX_USAGE" "Option '--${name}' does not take a value."
+      OPT[$name]=yes
+      OPT[__set_${name}]=1
+    fi
+    shift
+  done
+}
+
+opt() { printf '%s' "${OPT[$1]:-${2:-}}"; }
+opt_set() { [[ -n ${OPT[__set_$1]:-} ]]; }
+opt_flag() { [[ ${OPT[$1]:-no} == yes ]]; }
+
+# Global flags every command understands.
+readonly GLOBAL_SPEC_ENTRIES=(
+  "dry-run:flag:-n" "yes:flag:-y" "quiet:flag:-q" "verbose:flag:-v"
+  "json:flag" "help:flag:-h" "no-color:flag" "audit-log:value"
+)
+
+apply_global_options() {
+  opt_flag dry-run && DRY_RUN=true
+  opt_flag yes && ASSUME_YES=true
+  opt_flag quiet && QUIET=true
+  opt_flag verbose && VERBOSE=true
+  opt_flag json && JSON_OUTPUT=true
+  opt_set audit-log && AUDIT_LOG=$(opt audit-log)
+  return 0
+}
+
+# =============================================================================
+# Usage
+# =============================================================================
+
+print_usage() {
+  cat <<EOF
+${SCRIPT_NAME} ${USERS_PRO_VERSION} — local account lifecycle management
+
+Usage:
+  ${SCRIPT_NAME} <command> [options]
+  ${SCRIPT_NAME} tui                       Launch the full-screen interface
+
+Commands:
+  tui        Interactive terminal UI (recommended)
+  add        Create a local account
+  delete     Delete an account and its artifacts
+  info       Detailed report for one account
+  list       List accounts
+  edit       Modify an existing account
+  disable    Lock, expire and set nologin in one step
+  enable     Reverse 'disable'
+  keys       Manage SSH authorized_keys
+  audit      Show recent entries from the audit log
+  help       This text
+
+Global options (accepted by every command):
+  -n, --dry-run          Print intended actions without applying them
+  -y, --yes              Assume yes for all confirmations
+  -q, --quiet            Suppress informational output
+  -v, --verbose          Emit debug output
+      --json             Machine-readable output (info, list)
+      --no-color         Disable ANSI colour
+      --audit-log PATH   Override the audit log path
+  -h, --help             Command help
+
+add:
+  -u, --username USER        Required
+      --shell PATH           Login shell (default /bin/bash)
+      --comment TEXT         GECOS field
+      --groups LIST          Comma-separated supplementary groups
+      --uid N                Explicit UID
+      --home PATH            Explicit home directory
+      --expire-date DATE     YYYY-MM-DD, or -1/none
+      --ssh-password-auth V  yes|no (default: auto — applied only if sshd is present)
+      --allow-privileged     Permit sudo/admin/wheel/root membership
+      --sudo-nopasswd        Install a NOPASSWD sudoers drop-in
+      --generate-password    Generate a strong password and print it once
+      --password-stdin       Read the password from stdin (automation)
+      --no-password          Create the account with a locked password
+
+delete:
+  -u, --username USER        Required
+      --force                Override system/privileged guards; kill processes
+      --keep-home            Retain the home directory
+      --backup-home PATH     Archive the home first (.tar/.tar.gz/.tar.zst/.tar.xz)
+      --purge-temp           Also delete owned files in /tmp and /var/tmp
+
+info:
+  -u, --username USER        Required
+
+list:
+      --all                  Include system accounts
+      --locked               Only locked accounts
+      --privileged           Only accounts in a privileged group
+      --filter TEXT          Substring match on username or GECOS
+
+edit:
+  -u, --username USER        Required
+      --password             Prompt for and set a new password
+      --password-stdin       Read the new password from stdin
+      --generate-password    Generate a strong password and print it once
+      --lock / --unlock      Lock or unlock the password
+      --force-password-change
+      --shell PATH           --home PATH        --move-home
+      --comment TEXT         --expire-date DATE
+      --min-days N           --max-days N       --warn-days N   --inactive-days N
+      --add-groups LIST      --remove-groups LIST  --set-groups LIST
+      --ssh-password-auth V  --sudo-nopasswd V (yes|no)
+      --allow-privileged     --force
+
+keys:
+  -u, --username USER        Required
+      --list                 Show fingerprints
+      --add KEY              Append an OpenSSH public key
+      --add-file PATH        Append every key in a file
+      --remove PATTERN       Remove keys containing PATTERN (e.g. a comment)
+      --clear                Remove authorized_keys entirely
+
+Examples:
+  ${SCRIPT_NAME} tui
+  ${SCRIPT_NAME} add -u deploy --groups docker --generate-password
+  ${SCRIPT_NAME} edit -u deploy --max-days 90 --add-groups www-data
+  ${SCRIPT_NAME} delete -u deploy --backup-home /var/backups/deploy.tar.gz --force
+  ${SCRIPT_NAME} list --json | jq '.[] | select(.state=="LOCKED")'
+  ${SCRIPT_NAME} --dry-run delete -u olduser
+EOF
+}
+
+# FIX: the original routed every -h/--help through usage(), which wrote to
+# stderr and exited 1 — so `users-pro add --help | less` showed nothing and
+# scripts saw a failure. Help is success on stdout; misuse is failure on stderr.
+usage_error() { print_usage >&2; exit "$EX_USAGE"; }
+cmd_help() { print_usage; exit "$EX_OK"; }
+
+# =============================================================================
+# Commands
+# =============================================================================
+
+CURRENT_COMMAND=""
+trap_rc=0
+
+stage_password_for() {
+  local username=$1 generated=""
+  if opt_flag generate-password; then
+    generated=$(generate_password 20)
+    PASSWORD=$generated
+    printf 'Generated password for %s: %s\n' "$username" "$generated"
+    printf '(Shown once. Store it now.)\n'
+    return 0
+  fi
+  if opt_flag password-stdin; then
+    PASSWORD_FROM_STDIN=true
+    prompt_password "$username"
+    return 0
+  fi
+  prompt_password "$username"
+}
+
+cmd_add() {
+  # shellcheck disable=SC2034  # read via the `local -n _spec` nameref in parse_options
+  local -a spec=(
+    "${GLOBAL_SPEC_ENTRIES[@]}"
+    "username:value:-u" "shell:value" "comment:value" "gecos:value"
+    "groups:value" "uid:value" "home:value" "expire-date:value"
+    "ssh-password-auth:value" "allow-privileged:flag" "sudo-nopasswd:flag"
+    "generate-password:flag" "password-stdin:flag" "no-password:flag"
+  )
+  parse_options spec "$@"
+  opt_flag help && cmd_help
+  apply_global_options
+
+  local username; username=$(opt username)
+  [[ -n $username ]] || { log_error "-u/--username is required."; usage_error; }
+
+  validate_root
+  validate_dependencies
+  acquire_lock
+
+  local comment; comment=$(opt comment "$(opt gecos)")
+
+  if ! opt_flag no-password; then
+    stage_password_for "$username"
+  fi
+
+  account_create \
+    "$username" \
+    "$(opt shell /bin/bash)" \
+    "$comment" \
+    "$(opt groups)" \
+    "$(opt ssh-password-auth auto)" \
+    "$(opt allow-privileged no)" \
+    "$(opt uid)" \
+    "$(opt home)" \
+    "$(opt expire-date)" \
+    "$(opt sudo-nopasswd no)"
+}
+
+cmd_delete() {
+  # shellcheck disable=SC2034  # read via the `local -n _spec` nameref in parse_options
+  local -a spec=(
+    "${GLOBAL_SPEC_ENTRIES[@]}"
+    "username:value:-u" "force:flag" "keep-home:flag"
+    "backup-home:value" "purge-temp:flag"
+  )
+  parse_options spec "$@"
+  opt_flag help && cmd_help
+  apply_global_options
+
+  local username; username=$(opt username)
+  [[ -n $username ]] || { log_error "-u/--username is required."; usage_error; }
+
+  validate_root
+  validate_dependencies
+  acquire_lock
+  require_user_exists "$username"
+
+  if [[ $DRY_RUN == false ]]; then
+    confirm "Delete user '${username}'? This cannot be undone." ||
+      { log_info "Aborted."; exit "$EX_OK"; }
+  fi
+
+  account_delete "$username" "$(opt force no)" "$(opt keep-home no)" \
+                 "$(opt backup-home)" "$(opt purge-temp no)"
+}
+
+cmd_info() {
+  # shellcheck disable=SC2034  # read via the `local -n _spec` nameref in parse_options
+  local -a spec=("${GLOBAL_SPEC_ENTRIES[@]}" "username:value:-u")
+  parse_options spec "$@"
+  opt_flag help && cmd_help
+  apply_global_options
+
+  local username; username=$(opt username)
+  if [[ -z $username && ${#POSITIONAL[@]} -gt 0 ]]; then username=${POSITIONAL[0]}; fi
+  [[ -n $username ]] || { log_error "-u/--username is required."; usage_error; }
+
+  validate_dependencies
+  require_user_exists "$username"
+
+  if [[ $JSON_OUTPUT == true ]]; then
+    user_report_json "$username"
+    printf '\n'
+  else
+    user_report_text "$username"
+  fi
+}
+
+cmd_list() {
+  # shellcheck disable=SC2034  # read via the `local -n _spec` nameref in parse_options
+  local -a spec=(
+    "${GLOBAL_SPEC_ENTRIES[@]}"
+    "all:flag" "locked:flag" "privileged:flag" "filter:value"
+  )
+  parse_options spec "$@"
+  opt_flag help && cmd_help
+  apply_global_options
+
+  # FIX: the original gated `list` behind validate_root. Reading /etc/passwd
+  # needs no privilege, and forcing sudo for a listing is friction with no
+  # security benefit.
+  validate_dependencies
+
+  local include_system="no"
+  opt_flag all && include_system=yes
+  local filter; filter=$(opt filter)
+
+  if [[ $JSON_OUTPUT == true ]]; then
+    list_users_json "$include_system"
+    return 0
+  fi
+
+  printf '%-18s %-7s %-9s %-22s %s\n' "USER" "UID" "STATE" "HOME" "SHELL"
+  printf '%-18s %-7s %-9s %-22s %s\n' "------------------" "-------" "---------" \
+         "----------------------" "-------------------"
+
+  local username uid gid gecos home shell state
+  while IFS=: read -r username uid gid gecos home shell; do
+    [[ -n $username ]] || continue
+    if [[ -n $filter ]] && [[ ${username,,} != *"${filter,,}"* && ${gecos,,} != *"${filter,,}"* ]]; then
+      continue
+    fi
+    state=$(user_state_label "$username")
+    opt_flag locked && [[ $state != LOCKED && $state != DISABLED ]] && continue
+    opt_flag privileged && ! is_privileged_user "$username" && continue
+    printf '%-18s %-7s %-9s %-22s %s\n' "$username" "$uid" "$state" "$home" "$shell"
+  done < <(list_users "$include_system")
+  unset gid
+}
+
+cmd_edit() {
+  # shellcheck disable=SC2034  # read via the `local -n _spec` nameref in parse_options
+  local -a spec=(
+    "${GLOBAL_SPEC_ENTRIES[@]}"
+    "username:value:-u" "password:flag" "password-stdin:flag" "generate-password:flag"
+    "lock:flag" "unlock:flag" "force-password-change:flag"
+    "shell:value" "home:value" "move-home:flag" "comment:value" "gecos:value"
+    "expire-date:value" "inactive-days:value" "min-days:value" "max-days:value"
+    "warn-days:value" "add-groups:value" "remove-groups:value" "set-groups:value"
+    "ssh-password-auth:value" "sudo-nopasswd:value"
+    "allow-privileged:flag" "force:flag"
+  )
+  parse_options spec "$@"
+  opt_flag help && cmd_help
+  apply_global_options
+
+  local username; username=$(opt username)
+  [[ -n $username ]] || { log_error "-u/--username is required."; usage_error; }
+
+  validate_root
+  validate_dependencies
+  acquire_lock
+
+  local force; force=$(opt force no)
+  account_guard_editable "$username" "$force"
+
+  opt_flag lock && opt_flag unlock && die "-$EX_USAGE" "--lock and --unlock are mutually exclusive."
+  opt_flag move-home && [[ -z $(opt home) ]] && die "-$EX_USAGE" "--move-home requires --home."
+
+  local allow_priv changes=0
+  allow_priv=$(opt allow-privileged no)
+
+  if opt_flag password || opt_flag password-stdin || opt_flag generate-password; then
+    stage_password_for "$username"
+    set_user_password "$username" || die "-$EX_SOFTWARE" "Failed to set the password."
+    changes=$((changes + 1))
+  fi
+
+  opt_flag lock && { account_lock "$username"; changes=$((changes + 1)); }
+  opt_flag unlock && { account_unlock "$username"; changes=$((changes + 1)); }
+  opt_flag force-password-change && { account_force_password_change "$username"; changes=$((changes + 1)); }
+
+  opt_set shell && { account_set_shell "$username" "$(opt shell)"; changes=$((changes + 1)); }
+  opt_set home && { account_set_home "$username" "$(opt home)" "$(opt move-home no)"; changes=$((changes + 1)); }
+
+  if opt_set comment || opt_set gecos; then
+    account_set_comment "$username" "$(opt comment "$(opt gecos)")"
+    changes=$((changes + 1))
+  fi
+
+  opt_set expire-date && { account_set_expiry "$username" "$(opt expire-date)"; changes=$((changes + 1)); }
+
+  if opt_set min-days || opt_set max-days || opt_set warn-days || opt_set inactive-days; then
+    account_set_aging "$username" "$(opt min-days)" "$(opt max-days)" \
+                      "$(opt warn-days)" "$(opt inactive-days)"
+    changes=$((changes + 1))
+  fi
+
+  if opt_set set-groups; then
+    local -a set_groups=()
+    mapfile -t set_groups < <(csv_to_lines "$(opt set-groups)")
+    account_set_groups "$username" "$allow_priv" "${set_groups[@]+"${set_groups[@]}"}"
+    changes=$((changes + 1))
+  else
+    if opt_set add-groups; then
+      local -a add_groups=()
+      mapfile -t add_groups < <(csv_to_lines "$(opt add-groups)")
+      account_add_groups "$username" "$allow_priv" "${add_groups[@]+"${add_groups[@]}"}"
+      changes=$((changes + 1))
+    fi
+    if opt_set remove-groups; then
+      local -a rm_groups=()
+      mapfile -t rm_groups < <(csv_to_lines "$(opt remove-groups)")
+      account_remove_groups "$username" "${rm_groups[@]+"${rm_groups[@]}"}"
+      changes=$((changes + 1))
+    fi
+  fi
+
+  if opt_set ssh-password-auth; then
+    local mode; mode=$(normalize_yes_no "$(opt ssh-password-auth)")
+    configure_ssh_password_auth "$username" "$mode"
+    [[ $mode == yes ]] && ensure_ssh_service_active
+    changes=$((changes + 1))
+  fi
+
+  if opt_set sudo-nopasswd; then
+    account_set_sudo_nopasswd "$username" "$(normalize_yes_no "$(opt sudo-nopasswd)")"
+    changes=$((changes + 1))
+  fi
+
+  if (( changes == 0 )); then
+    log_info "No changes requested for '${username}'."
+  else
+    log_info "Applied ${changes} change(s) to '${username}'."
+  fi
+}
+
+cmd_disable() {
+  # shellcheck disable=SC2034  # read via the `local -n _spec` nameref in parse_options
+  local -a spec=("${GLOBAL_SPEC_ENTRIES[@]}" "username:value:-u" "force:flag")
+  parse_options spec "$@"
+  opt_flag help && cmd_help
+  apply_global_options
+  local username; username=$(opt username)
+  [[ -n $username ]] || { log_error "-u/--username is required."; usage_error; }
+  validate_root; validate_dependencies; acquire_lock
+  account_guard_editable "$username" "$(opt force no)"
+  confirm "Disable '${username}' (lock + expire + nologin)?" || { log_info "Aborted."; exit "$EX_OK"; }
+  account_disable "$username"
+}
+
+cmd_enable() {
+  # shellcheck disable=SC2034  # read via the `local -n _spec` nameref in parse_options
+  local -a spec=("${GLOBAL_SPEC_ENTRIES[@]}" "username:value:-u" "shell:value" "force:flag")
+  parse_options spec "$@"
+  opt_flag help && cmd_help
+  apply_global_options
+  local username; username=$(opt username)
+  [[ -n $username ]] || { log_error "-u/--username is required."; usage_error; }
+  validate_root; validate_dependencies; acquire_lock
+  account_guard_editable "$username" "$(opt force no)"
+  account_enable "$username" "$(opt shell /bin/bash)"
+}
+
+cmd_keys() {
+  # shellcheck disable=SC2034  # read via the `local -n _spec` nameref in parse_options
+  local -a spec=(
+    "${GLOBAL_SPEC_ENTRIES[@]}"
+    "username:value:-u" "list:flag" "add:value" "add-file:value"
+    "remove:value" "clear:flag"
+  )
+  parse_options spec "$@"
+  opt_flag help && cmd_help
+  apply_global_options
+
+  local username; username=$(opt username)
+  [[ -n $username ]] || { log_error "-u/--username is required."; usage_error; }
+  validate_dependencies
+  require_user_exists "$username"
+
+  if opt_flag list || { ! opt_set add && ! opt_set add-file && ! opt_set remove && ! opt_flag clear; }; then
+    printf 'Authorized keys for %s (%s):\n' "$username" "$(ssh_key_count "$username")"
+    ssh_key_fingerprints "$username"
+    return 0
+  fi
+
+  validate_root
+  acquire_lock
+
+  opt_set add && ssh_add_authorized_key "$username" "$(opt add)"
+
+  if opt_set add-file; then
+    local file line
+    file=$(opt add-file)
+    [[ -r $file ]] || die "-$EX_DATAERR" "Cannot read key file '${file}'."
+    while IFS= read -r line; do
+      [[ -z $line || $line == \#* ]] && continue
+      ssh_add_authorized_key "$username" "$line"
+    done <"$file"
+  fi
+
+  opt_set remove && ssh_remove_authorized_key "$username" "$(opt remove)"
+
+  if opt_flag clear; then
+    confirm "Remove all authorized keys for '${username}'?" || { log_info "Aborted."; exit "$EX_OK"; }
+    ssh_clear_authorized_keys "$username"
+  fi
+}
+
+cmd_audit() {
+  # shellcheck disable=SC2034  # read via the `local -n _spec` nameref in parse_options
+  local -a spec=("${GLOBAL_SPEC_ENTRIES[@]}" "lines:value:-l")
+  parse_options spec "$@"
+  opt_flag help && cmd_help
+  apply_global_options
+  local lines; lines=$(opt lines 50)
+  validate_uint "$lines"
+  [[ -r $AUDIT_LOG ]] || die "-$EX_UNAVAILABLE" "Audit log '${AUDIT_LOG}' is not readable."
+  tail -n "$lines" -- "$AUDIT_LOG"
+}
+
+cmd_tui() {
+  local tui="${SCRIPT_DIR}/users-pro-tui"
+  [[ -x $tui ]] || die "-$EX_UNAVAILABLE" "TUI front-end not found at ${tui}."
+  exec "$tui" "$@"
+}
+
+# =============================================================================
+# Dispatch
+# =============================================================================
+
+main() {
+  (( $# > 0 )) || cmd_tui
+  local command=$1
+  shift
+  CURRENT_COMMAND=$command
+
+  case $command in
+    tui|ui)          cmd_tui "$@" ;;
+    add|create)      cmd_add "$@" ;;
+    delete|remove|del) cmd_delete "$@" ;;
+    info|show)       cmd_info "$@" ;;
+    list|ls)         cmd_list "$@" ;;
+    edit|modify)     cmd_edit "$@" ;;
+    disable)         cmd_disable "$@" ;;
+    enable)          cmd_enable "$@" ;;
+    keys|key)        cmd_keys "$@" ;;
+    audit|log)       cmd_audit "$@" ;;
+    help|-h|--help)  cmd_help ;;
+    -V|--version)    printf '%s %s\n' "$SCRIPT_NAME" "$USERS_PRO_VERSION"; exit "$EX_OK" ;;
+    *)               log_error "Unknown command: ${command}"; usage_error ;;
+  esac
+}
+
+main "$@"

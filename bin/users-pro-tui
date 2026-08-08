@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# =============================================================================
+# users-pro-tui — Full-screen terminal interface for local account management.
+# Usage: users-pro-tui [--dry-run] [--no-color] [--audit-log PATH]
+# =============================================================================
+
+set -Eeuo pipefail
+
+_self=${BASH_SOURCE[0]}
+while [[ -L $_self ]]; do
+  _target=$(readlink -- "$_self")
+  [[ $_target == /* ]] && _self=$_target || _self=$(dirname -- "$_self")/$_target
+done
+SCRIPT_DIR=$(cd -- "$(dirname -- "$_self")" && pwd -P)
+LIB_DIR=${USERS_PRO_LIB:-$(cd -- "${SCRIPT_DIR}/../lib" && pwd -P)}
+readonly SCRIPT_DIR LIB_DIR
+unset _self _target
+
+# shellcheck source=../lib/core.sh
+source "${LIB_DIR}/core.sh"
+# shellcheck source=../lib/ssh.sh
+source "${LIB_DIR}/ssh.sh"
+# shellcheck source=../lib/query.sh
+source "${LIB_DIR}/query.sh"
+# shellcheck source=../lib/account.sh
+source "${LIB_DIR}/account.sh"
+# shellcheck source=tui/term.sh
+source "${LIB_DIR}/tui/term.sh"
+# shellcheck source=tui/input.sh
+source "${LIB_DIR}/tui/input.sh"
+# shellcheck source=tui/widgets.sh
+source "${LIB_DIR}/tui/widgets.sh"
+# shellcheck source=tui/app.sh
+source "${LIB_DIR}/tui/app.sh"
+
+# The UI owns the screen, so library logging is captured rather than printed.
+LOG_TO_STDERR=false
+UI_CONTEXT=tui
+
+usage() {
+  cat <<EOF
+users-pro-tui ${USERS_PRO_VERSION} — interactive account management
+
+Usage: users-pro-tui [options]
+
+Options:
+  -n, --dry-run        Start in dry-run mode (toggle later with D)
+      --no-color       Disable ANSI colour
+      --audit-log PATH Override the audit log path
+  -h, --help           Show this help
+
+Run as root to make changes; without root the interface is read-only.
+EOF
+}
+
+while (( $# > 0 )); do
+  case $1 in
+    -n|--dry-run)  DRY_RUN=true ;;
+    --no-color)    USERS_PRO_NO_COLOR=true ;;
+    --audit-log)   [[ $# -ge 2 ]] || { printf 'Option %s requires a value.\n' "$1" >&2; exit 64; }
+                   AUDIT_LOG=$2; shift ;;
+    --audit-log=*) AUDIT_LOG=${1#*=} ;;
+    -h|--help)     usage; exit 0 ;;
+    *)             printf 'Unknown option: %s\n' "$1" >&2; usage >&2; exit 64 ;;
+  esac
+  shift
+done
+
+# shellcheck disable=SC2329  # invoked via the EXIT trap
+tui_cleanup() {
+  local rc=$?
+  term_leave
+  release_lock
+  PASSWORD=""
+  # Surface anything that failed after the screen is back to normal.
+  if (( rc != 0 )) && (( ${#LOG_BUFFER[@]} > 0 )); then
+    printf 'users-pro-tui exited with code %s. Last messages:\n' "$rc" >&2
+    local entry
+    for entry in "${LOG_BUFFER[@]: -8}"; do
+      printf '  [%s] %s\n' "${entry%%|*}" "${entry#*|}" >&2
+    done
+  fi
+  return "$rc"
+}
+trap 'tui_cleanup' EXIT
+trap 'term_leave; exit 130' INT TERM
+
+setup_palette
+validate_dependencies
+term_enter
+app_main
+term_leave
+
+exit 0
